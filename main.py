@@ -3,31 +3,66 @@ import numpy as np
 import mediapipe as mp
 from time import time
 import threading
-import facial_recognition as fr
-
+import face_recognition
+import os
 
 ############################################
-# -------- SPEED CONFIG --------------------
+# CONFIG
 ############################################
 INPUT_WIDTH = 640
 INPUT_HEIGHT = 360
-PROCESS_EVERY_N_FRAMES = 1          # process every frame
-FALL_PERSIST_SECONDS = 5
-MATCH_THRESHOLD = 60                 # person tracking distance
-
-
-############################################
-# -------- STATE ---------------------------
-############################################
-frame_count = 0
-people = {}
-fall_history = {}
-next_id = 1
+FALL_PERSIST_SECONDS = 1.5
+MATCH_THRESHOLD = 60
 MAX_HISTORY = 8
 
+people = {}
+fall_history = {}
+cctv_history = {}
+next_id = 1
 
 ############################################
-# -------- THREAD CAPTURE ------------------
+# LOAD KNOWN FACES
+############################################
+known_faces = []
+known_names = []
+
+def load_known_faces():
+    folder = "known"
+    if not os.path.exists(folder):
+        print("known folder not found")
+        return
+
+    for image in os.listdir(folder):
+        path = os.path.join(folder, image)
+
+        img = face_recognition.load_image_file(path)
+        enc = face_recognition.face_encodings(img)
+
+        if len(enc) == 0:
+            continue
+
+        known_faces.append(enc[0])
+        known_names.append(image.split(".")[0].lower())
+
+    print("Faces Loaded:", known_names)
+
+def is_known(frame):
+    small = cv2.resize(frame, (0,0), fx=0.25, fy=0.25)
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+    faces = face_recognition.face_locations(rgb)
+    encodings = face_recognition.face_encodings(rgb, faces)
+
+    for enc in encodings:
+        matches = face_recognition.compare_faces(known_faces, enc)
+        if True in matches:
+            return True
+
+    return False
+
+
+############################################
+# CAMERA THREAD
 ############################################
 class FastCamera:
     def __init__(self, src=0):
@@ -37,9 +72,7 @@ class FastCamera:
 
         self.ret = False
         self.frame = None
-
-        thread = threading.Thread(target=self.update, daemon=True)
-        thread.start()
+        threading.Thread(target=self.update, daemon=True).start()
 
     def update(self):
         while True:
@@ -53,7 +86,7 @@ class FastCamera:
 
 
 ############################################
-# -------- PERSON ID LOGIC -----------------
+# PERSON TRACKING
 ############################################
 def get_centroid(lm):
     xs = [p[0] for p in lm]
@@ -67,12 +100,13 @@ def assign_person_id(centroid):
     if not people:
         pid = next_id
         next_id += 1
-        people[pid] = {"centroid": centroid, "state": "NORMAL", "fall_time": 0, "last_seen": time()}
+        people[pid] = {"centroid": centroid, "state": "NORMAL", "fall_time": 0}
         fall_history[pid] = []
+        cctv_history[pid] = []
         return pid
 
     best_match = None
-    best_dist = 99999
+    best_dist = 1e9
 
     for pid, data in people.items():
         px, py = data["centroid"]
@@ -83,36 +117,33 @@ def assign_person_id(centroid):
 
     if best_dist < MATCH_THRESHOLD:
         people[best_match]["centroid"] = centroid
-        people[best_match]["last_seen"] = time()
         return best_match
 
     pid = next_id
     next_id += 1
-    people[pid] = {"centroid": centroid, "state": "NORMAL", "fall_time": 0, "last_seen": time()}
+    people[pid] = {"centroid": centroid, "state": "NORMAL", "fall_time": 0}
     fall_history[pid] = []
+    cctv_history[pid] = []
     return pid
 
 
 ############################################
-# --------- FALL LOGIC (YOUR LOGIC) --------
+# -------- FRONT FALL LOGIC ----------------
 ############################################
-def detectFall(pid, lm):
-    if not lm or len(lm) < 33:
-        return False
+def detect_front_fall(pid, lm):
+    head = lm[0][1]
+    shoulder = (lm[11][1] + lm[12][1]) / 2
+    hip = (lm[23][1] + lm[24][1]) / 2
+    knee = (lm[25][1] + lm[26][1]) / 2
 
-    head_y = lm[0][1]
-    shoulder_y = (lm[11][1] + lm[12][1]) / 2
-    hip_y = (lm[23][1] + lm[24][1]) / 2
-    knee_y = (lm[25][1] + lm[26][1]) / 2
-
-    torso_length = abs(hip_y - shoulder_y)
+    torso = abs(hip - shoulder)
 
     fall_history[pid].append({
-        "head": head_y,
-        "shoulder": shoulder_y,
-        "hip": hip_y,
-        "knee": knee_y,
-        "torso": torso_length
+        "head": head,
+        "shoulder": shoulder,
+        "hip": hip,
+        "knee": knee,
+        "torso": torso
     })
 
     if len(fall_history[pid]) > MAX_HISTORY:
@@ -126,96 +157,160 @@ def detectFall(pid, lm):
 
     shoulder_drop = curr["shoulder"] - prev["shoulder"]
     torso_collapse = (prev["torso"] - curr["torso"]) > 40
-    horizontal_body = abs(curr["shoulder"] - curr["hip"]) < 25
+    horizontal = abs(curr["shoulder"] - curr["hip"]) < 25
     knee_bend = (curr["knee"] - prev["knee"]) > 50
     head_crash = (curr["head"] - prev["head"]) > 60 and curr["head"] >= prev["hip"]
 
-    fall = (
-        (shoulder_drop > 60 and torso_collapse and horizontal_body)
+    return (
+        (shoulder_drop > 60 and torso_collapse and horizontal)
         or (knee_bend and shoulder_drop > 45)
         or head_crash
     )
 
-    return fall
+
+############################################
+# -------- CCTV FALL LOGIC -----------------
+############################################
+def detect_cctv_fall(pid, lm):
+    if len(lm) < 33:
+        return False
+
+    head = lm[0][1]
+    shoulder = (lm[11][1] + lm[12][1]) / 2
+    hip = (lm[23][1] + lm[24][1]) / 2
+    knee = (lm[25][1] + lm[26][1]) / 2
+
+    torso = abs(hip - shoulder)
+    if torso <= 0:
+        return False
+
+    cctv_history[pid].append({
+        "torso": torso,
+        "head": head,
+        "shoulder": shoulder,
+        "knee": knee
+    })
+
+    if len(cctv_history[pid]) > MAX_HISTORY:
+        cctv_history[pid].pop(0)
+
+    if len(cctv_history[pid]) < MAX_HISTORY:
+        return False
+
+    prev = cctv_history[pid][0]
+    curr = cctv_history[pid][-1]
+
+    torso_ratio = curr["torso"] / prev["torso"]
+
+    torso_flat = torso_ratio < 0.55
+    head_drop = (curr["head"] - prev["head"]) > 45
+    shoulder_drop = (curr["shoulder"] - prev["shoulder"]) > 40
+    knee_rise = (prev["knee"] - curr["knee"]) > 20
+
+    if knee_rise:
+        return False
+
+    return torso_flat and head_drop and shoulder_drop
 
 
 ############################################
-# -------- LANDMARK DRAW -------------------
+# MEDIAPIPE MULTI-PERSON POSE
 ############################################
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=1,
-    smooth_landmarks=True,
-    min_detection_confidence=0.6,
-    min_tracking_confidence=0.6
+model_path = "models/pose_landmarker_full.task"
+
+BaseOptions = mp.tasks.BaseOptions
+PoseLandmarker = mp.tasks.vision.PoseLandmarker
+PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+options = PoseLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=model_path),
+    running_mode=VisionRunningMode.VIDEO,
+    num_poses=5
 )
 
-def draw_landmarks(frame, pose_landmarks, fallen=False):
+pose_detector = PoseLandmarker.create_from_options(options)
+
+
+############################################
+# DRAW
+############################################
+POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS
+
+def draw(frame, person_landmarks, fallen=False):
     color = (0, 0, 255) if fallen else (0, 255, 0)
     h, w, _ = frame.shape
 
-    for c in mp_pose.POSE_CONNECTIONS:
-        s = pose_landmarks.landmark[c[0]]
-        e = pose_landmarks.landmark[c[1]]
-        cv2.line(frame, (int(s.x*w), int(s.y*h)),
-                 (int(e.x*w), int(e.y*h)), color, 2)
-
-    for lm in pose_landmarks.landmark:
+    for lm in person_landmarks:
         cv2.circle(frame, (int(lm.x*w), int(lm.y*h)), 4, color, -1)
 
+    for c in POSE_CONNECTIONS:
+        s = person_landmarks[c[0]]
+        e = person_landmarks[c[1]]
+        cv2.line(frame,
+                 (int(s.x*w), int(s.y*h)),
+                 (int(e.x*w), int(e.y*h)),
+                 color, 2)
+
 
 ############################################
-# -------- VIDEO LOOP ----------------------
+# MAIN
 ############################################
-frr = fr.FaceRecognition()
-frr.encode_faces()
-
+load_known_faces()
 cam = FastCamera(0)
+frame_index = 0
 
 while True:
     ret, frame = cam.read()
     if not ret:
         continue
 
-    frame_count += 1
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb)
+    h, w, _ = frame.shape
 
-    if results.pose_landmarks:
-        h, w, _ = frame.shape
-        lm = results.pose_landmarks.landmark
-        landmarks = [(int(l.x*w), int(l.y*h), l.z) for l in lm]
+    known = is_known(frame)
 
-        centroid = get_centroid(landmarks)
-        pid = assign_person_id(centroid)
+    label = "KNOWN" if known else "UNKNOWN"
+    col = (0,255,0) if known else (0,0,255)
 
-        fell = detectFall(pid, landmarks)
+    cv2.putText(frame, label, (20,40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, col, 3)
 
-        if fell and people[pid]["state"] != "FALLEN":
-            people[pid]["state"] = "FALLEN"
-            people[pid]["fall_time"] = time()
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        if people[pid]["state"] == "FALLEN":
-            if time() - people[pid]["fall_time"] < FALL_PERSIST_SECONDS:
-                draw_landmarks(frame, results.pose_landmarks, True)
-                cv2.putText(frame, f"ID {pid} - FALL DETECTED",
-                            (20, 40+pid*25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                            (0,0,255), 2)
-            else:
-                people[pid]["state"] = "NORMAL"
-                draw_landmarks(frame, results.pose_landmarks, False)
-        else:
-            draw_landmarks(frame, results.pose_landmarks, False)
+    result = pose_detector.detect_for_video(mp_image, frame_index)
+    frame_index += 1
 
-    # Cleanup disappeared people
-    remove_list = [pid for pid,p in people.items() if time() - p["last_seen"] > 4]
-    for pid in remove_list:
-        del people[pid]
-        fall_history.pop(pid, None)
+    if result.pose_landmarks:
+        for pose_landmarks in result.pose_landmarks:
+            lm = [(int(p.x*w), int(p.y*h), p.z) for p in pose_landmarks]
 
-    cv2.imshow("FAST CROWD FALL + FACE SYSTEM", frame)
+            centroid = get_centroid(lm)
+            pid = assign_person_id(centroid)
+
+            front = detect_front_fall(pid, lm)
+            cctv = detect_cctv_fall(pid, lm)
+
+            fell = front or cctv
+
+            if fell:
+                people[pid]["state"] = "FALLEN"
+                people[pid]["fall_time"] = time()
+
+            fallen = (
+                people[pid]["state"] == "FALLEN" and
+                time() - people[pid]["fall_time"] < FALL_PERSIST_SECONDS
+            )
+
+            draw(frame, pose_landmarks, fallen)
+
+            if fallen:
+                cv2.putText(frame, "FALL DETECTED",
+                            (centroid[0], centroid[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (0, 0, 255), 2)
+
+    cv2.imshow("MULTI PERSON FALL DETECTION", frame)
 
     if cv2.waitKey(1) & 0xFF == 27:
         break
